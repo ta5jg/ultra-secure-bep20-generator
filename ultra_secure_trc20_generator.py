@@ -5,7 +5,7 @@ Aynı ``collect_config`` motorunu ``ultra_secure_bep20_generator`` ile paylaşı
 
 Profil seçenekleri (BEP20 script ile aynı):
 - Stablecoin vs volatil, serbest decimals, varsayılan 10 M initial supply
-- Varsayılan sınırsız mint tavanı (``ERC20Capped(type(uint256).max)``)
+- Varsayılan mint tavanı: ``min(initial × 10, 1_000_000_000)`` token (``uint256.max`` yok)
 
 Varsayılan ad/sembol soruları: Tether USD Bridged ZED20 (USDT.z).
 

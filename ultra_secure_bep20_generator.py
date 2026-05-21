@@ -2,13 +2,14 @@
 
 Varsayılan üretim profili: BNB Smart Chain (BEP20) — ``Tether USD Bridged ZED20`` (``USDT.z``).
 [1/7] adımında **stablecoin / volatil** seçilir; **decimals** 0–30 arası seçilebilir (öneriler: 6 / 18).
-**Initial supply** varsayılan ``10_000_000``; **mint üst limiti** varsayılan ``uint256.max`` (sınırsız).
+**Initial supply** varsayılan ``10_000_000``; **mint tavanı** ``min(initial × 10, 1_000_000_000)`` token
+(``uint256.max`` yok — tarayıcı/cüzdan rug-pull uyarısı önlenir).
 İnteraktif sorularda Enter ile bu politikalar seçilebilir; Tron için ``ultra_secure_trc20_generator.py``.
 
 Desteklenen zincirler: BSC, Ethereum, Polygon, Arbitrum, Base, Tron, Multi-chain.
 
 Özellikler:
-- ERC20 + Capped (cap = uint256 seçeneği: pratikte sınırsız mint) + Burnable + Pausable + AccessControl + Ownable2Step
+- ERC20 + ERC20Capped (sabit üst sınır: min(initial×çarpan, 1B token); mintable) + Burnable + Pausable + AccessControl + Ownable2Step
 - Stablecoin / volatil profil seçimi (decimals & fiyat metadata önerileri)
 - Initial supply varsayılan 10 milyon; decimals serbest seçim (0–30)
 - Anti-bot launch-window (configurable, exempt mapping)
@@ -25,6 +26,7 @@ Desteklenen zincirler: BSC, Ethereum, Polygon, Arbitrum, Base, Tron, Multi-chain
 - Tron için pragma 0.8.18 + TronBox config + migrations
 - Diğer EVM zincirler için pragma 0.8.28 + Hardhat çoklu network
 - Auto-verify (BscScan/Etherscan/Polygonscan/...)
+- Zorunlu Multi-DEX oracle consensus (PancakeSwap/Uniswap/SunSwap Factory pair hash + gölge RPC)
 """
 
 import os
@@ -206,24 +208,35 @@ DEFAULT_BEP20_TOKEN_NAME = "Tether USD Bridged ZED20"
 DEFAULT_BEP20_TOKEN_SYMBOL = "USDT.z"
 # Varsayılan arz/limit politikası (her iki generator script’te kullanılır)
 DEFAULT_INITIAL_SUPPLY_UNITS = 10_000_000  # 10 milyon token (decimals öncesi)
+DEFAULT_CAP_MULTIPLIER = 10               # cap = initial × 10 (varsayılan)
+MAX_CAP_SUPPLY_UNITS = 1_000_000_000      # mutlak tavan: 1 milyar token (uint256.max yerine)
 DEFAULT_DECIMALS_STABLECOIN = 6
 DEFAULT_DECIMALS_VOLATILE = 18
 
 
+def compute_cap_supply(total_supply: int, cap_multiplier: int) -> int:
+    """Mint tavanı (tam token adedi): min(initial × çarpan, MAX_CAP_SUPPLY_UNITS)."""
+    mult = max(1, int(cap_multiplier))
+    return min(int(total_supply) * mult, MAX_CAP_SUPPLY_UNITS)
+
+
 def cap_solidity_constructor_arg(cfg: dict) -> str:
-    """ERC20Capped yapıcı argümanı: sınırsız için uint256.max, aksi capped formül."""
-    if cfg.get("cap_unlimited"):
-        return "type(uint256).max"
+    """ERC20Capped yapıcı argümanı — her zaman somut cap; uint256.max kullanılmaz."""
     decimals = cfg["decimals"]
     cap_supply = cfg["cap_supply"]
     return f"{cap_supply} * 10 ** {decimals}"
 
 
 def describe_cap_human(cfg: dict) -> str:
-    if cfg.get("cap_unlimited"):
-        return "pratikte sınırsız (cap = uint256.max, MINTER sınırsızca basabilir)"
     mult = cfg["cap_multiplier"]
-    return f'{cfg["cap_supply"]} token ({mult}× initial)'
+    cap = cfg["cap_supply"]
+    initial = cfg["total_supply"]
+    if cap < initial * mult:
+        return (
+            f"cap {cap:,} token = min({mult}× initial {initial:,}, "
+            f"tavan {MAX_CAP_SUPPLY_UNITS:,}); MINTER mint cap'e kadar"
+        )
+    return f"cap {cap:,} token ({mult}× initial); MINTER mint cap'e kadar"
 
 
 # -------------------------- Solidity Templates --------------------------
@@ -926,6 +939,7 @@ echo "🐍 Python audit araçları (opsiyonel)..."
 pip3 install --upgrade pip setuptools wheel || true
 pip3 install slither-analyzer mythril || true
 pip3 install markdown pdfkit matplotlib || true
+pip3 install -r backend/requirements.txt 2>/dev/null || pip3 install requests flask pycryptodome || true
 
 if ! command -v forge >/dev/null 2>&1; then
   echo "🔨 Foundry kuruluyor..."
@@ -1377,6 +1391,7 @@ def build_deploy_script(cfg: dict) -> str:
     contract_id = cfg["contract_id"]
     auto_verify = cfg["auto_verify"]
     is_uups = cfg["include_uups"]
+    multi_dex_gate = _multi_dex_deploy_gate_js()
 
     admin_arg = '''const adminEnv = process.env.ADMIN_ADDRESS;
   const admin = adminEnv && adminEnv.startsWith("0x") ? adminEnv : deployer.address;
@@ -1455,6 +1470,7 @@ async function main() {{
     }}, null, 2)
   );
 {verify_block}
+{multi_dex_gate}
 }}
 
 main().catch((err) => {{ console.error(err); process.exitCode = 1; }});
@@ -1495,6 +1511,7 @@ async function main() {{
     }}, null, 2)
   );
 {verify_block}
+{multi_dex_gate}
 }}
 
 main().catch((err) => {{ console.error(err); process.exitCode = 1; }});
@@ -1528,16 +1545,9 @@ def build_main_test(cfg: dict) -> str:
     deploy = _deploy_block(cfg, "[owner, alice, bob, carol] = await ethers.getSigners();")
 
     enable_trading = "    if (!(await token.tradingEnabled())) await token.enableTrading();" if trading_flag else ""
-    cap_unlimited = cfg.get("cap_unlimited", False)
     initial_supply_num = cfg["total_supply"]
 
-    if cap_unlimited:
-        cap_test = f"""  it("pratikte sınırsız cap — ek mint çok büyük miktarda çalışır", async function () {{
-    const bump = ethers.parseUnits("250000", {decimals});
-    await token.mint(alice.address, bump);
-    expect(await token.balanceOf(alice.address)).to.equal(bump);
-  }});"""
-    elif cap_supply == initial_supply_num:
+    if cap_supply == initial_supply_num:
         cap_test = f"""  it("cap dolu, mint revert eder (fixed supply davranışı)", async function () {{
     const MINTER_ROLE = await token.MINTER_ROLE();
     expect(await token.hasRole(MINTER_ROLE, owner.address)).to.equal(true);
@@ -1551,15 +1561,16 @@ def build_main_test(cfg: dict) -> str:
     expect(await token.balanceOf(alice.address)).to.equal(amount);
   }});"""
     else:
-        cap_test = """  it("cap > initial; mint cap'e kadar çalışır", async function () {
+        cap_test = f"""  it("cap > initial; mint cap'e kadar çalışır (uint256.max yok)", async function () {{
     const cap = await token.cap();
     const supply = await token.totalSupply();
+    expect(cap).to.be.lt(ethers.MaxUint256);
     const headroom = cap - supply;
-    if (headroom > 0n) {
+    if (headroom > 0n) {{
       await token.mint(alice.address, headroom);
-    }
+    }}
     await expect(token.mint(alice.address, 1)).to.be.reverted;
-  });"""
+  }});"""
 
     return f"""const {{ expect }} = require("chai");
 const {{ ethers }} = require("hardhat");
@@ -1915,7 +1926,7 @@ def build_audit_report_md(cfg: dict) -> str:
 - Max-tx / max-wallet limits (with exemption).
 - Burn-fee + transfer-fee (each capped at 5%).
 - `rescueTokens` / `rescueETH` use SafeERC20 + ReentrancyGuard.
-- `mint(...)` capped by ERC20Capped (üst limit `cap()`; seçenek `uint256.max` ise MINTER teorik üst limite kadar basabilir).
+- `mint(...)` yalnızca `MINTER_ROLE` ile ve `ERC20Capped.cap()` sınırına kadar (somut cap; `uint256.max` yok).
 - Granular roles: MINTER, PAUSER, BLACKLIST, FEE, LIMIT{', SNAPSHOT' if cfg['include_snapshot'] else ''}{', UPGRADER' if cfg['include_uups'] else ''}.
 - Ownable2Step.
 
@@ -2047,6 +2058,22 @@ PREDICT_MODE=create2 FACTORY_ADDRESS=0x... CREATE2_SALT=0x... \
 > matematiksel olarak 2^160 olasılık demektir; vanity miner ile sadece **prefix/suffix**
 > eşlemesi yapılabilir (6-8 karakter mantıklı sınır).
 
+## Multi-DEX Oracle Consensus (ZORUNLU)
+
+Gölge (paralel) RPC'lerin BscScan'de olmayan uydurma kontratları import etmesine karşı:
+
+- `backend/multi_dex_verifier.py` — PancakeSwap / Uniswap / SunSwap Factory **getPair ↔ CREATE2 hash**
+- `scripts/deploy.js` deploy sonrası otomatik kapı (`MULTI_DEX_VERIFY=1`)
+- `backend/api.py` — cüzdan/dApp REST: `POST /api/verify`
+
+```bash
+python3 backend/multi_dex_verifier.py --chain bsc --address 0xYourToken
+TOKEN_ADDRESS=0x... npx hardhat run scripts/verify-multi-dex.js --network bsc
+npm run backend:api   # dApp için
+```
+
+Detay: [docs/MULTI_DEX_VERIFICATION.md](./docs/MULTI_DEX_VERIFICATION.md)
+
 ## Audit
 ```bash
 python3 audit_runner.py --fast    # Hardhat + Slither
@@ -2072,17 +2099,14 @@ def build_metadata_files(cfg: dict, metadata_dir: str) -> None:
         "decimals": cfg["decimals"],
         "total_supply": str(cfg["total_supply"]),
         "asset_class": cfg.get("asset_class", "volatile"),
-        "cap_unlimited": cfg.get("cap_unlimited", False),
         "cap_supply": str(cfg["cap_supply"]),
+        "cap_multiplier": cfg["cap_multiplier"],
+        "max_cap_units": MAX_CAP_SUPPLY_UNITS,
         "cap_policy": describe_cap_human(cfg),
         "description": "Ultra Secure BEP20/TRC20 Token with audit-ready configuration."
     }, indent=2))
 
-    cap_feat = (
-        "Capped mint (effective unlimited ceiling)"
-        if cfg.get("cap_unlimited")
-        else "Capped mint (above initial supply until cap)"
-    )
+    cap_feat = "Capped mint (min(initial×mult, 1B tokens); no uint256.max)"
     features = ["Pausable", "Blacklist", "Burnable", cap_feat,
                 "AccessControl", "Anti-bot (configurable)",
                 "Fee-on-Transfer (capped)", "Burn-on-Transfer (capped)",
@@ -2155,6 +2179,285 @@ remappings = [
         "loop-bound": 10,
         "enable-assertions": True
     }, indent=2))
+
+
+# -------------------------- Multi-DEX Security (shadow RPC gate) --------------------------
+
+_GENERATOR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _multi_dex_deploy_gate_js() -> str:
+    """Deploy sonrası zorunlu Python multi_dex_verifier kapısı."""
+    return """
+  // --- Zorunlu Multi-DEX / RPC konsensüs kapısı (gölge RPC import savunması) ---
+  if (process.env.MULTI_DEX_VERIFY !== "0") {
+    const { execSync } = require("child_process");
+    const chainByNetwork = {
+      bsc: "bsc", bscTestnet: "bsc",
+      mainnet: "ethereum", sepolia: "ethereum",
+      ethereum: "ethereum",
+      polygon: "ethereum", arbitrum: "ethereum", base: "ethereum",
+    };
+    const chain = chainByNetwork[hre.network.name] || "bsc";
+    const verifyAddr = address;
+    console.log("🛡️ Multi-DEX oracle consensus (Factory pair hash + RPC consensus)...");
+    try {
+      execSync(
+        `python3 backend/multi_dex_verifier.py --chain ${chain} --address ${verifyAddr}`,
+        { stdio: "inherit", cwd: path.join(__dirname, "..") }
+      );
+      console.log("✅ Multi-DEX doğrulaması geçti.");
+    } catch (e) {
+      console.error("🚨 Deploy reddedildi: sahte/gölge kontrat veya DEX factory uyuşmazlığı.");
+      process.exit(1);
+    }
+  } else {
+    console.warn("⚠️ MULTI_DEX_VERIFY=0 — gölge RPC koruması devre dışı (önerilmez).");
+  }
+"""
+
+
+def build_verify_multi_dex_js() -> str:
+    return """const hre = require("hardhat");
+const { execSync } = require("child_process");
+const path = require("path");
+
+async function main() {
+  const address = process.env.TOKEN_ADDRESS || process.env.CONTRACT_ADDRESS;
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new Error("TOKEN_ADDRESS veya CONTRACT_ADDRESS (0x…) gerekli.");
+  }
+  const chainByNetwork = {
+    bsc: "bsc", bscTestnet: "bsc",
+    mainnet: "ethereum", sepolia: "ethereum",
+    ethereum: "ethereum",
+    polygon: "ethereum", arbitrum: "ethereum", base: "ethereum",
+  };
+  const net = await hre.ethers.provider.getNetwork();
+  const chain = chainByNetwork[hre.network.name] || process.env.CHAIN || "bsc";
+  console.log("Network:", hre.network.name, "chainId:", Number(net.chainId));
+  console.log("Token:", address, "→ chain profile:", chain);
+  execSync(
+    `python3 backend/multi_dex_verifier.py --chain ${chain} --address ${address} --json`,
+    { stdio: "inherit", cwd: path.join(__dirname, "..") }
+  );
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });
+"""
+
+
+def build_backend_api_py() -> str:
+    return '''#!/usr/bin/env python3
+"""Minimal backend API — cüzdan/dApp katmanı Multi-DEX doğrulaması."""
+import os
+from flask import Flask, jsonify, request
+
+from multi_dex_verifier import verify_contract_on_multi_dex
+
+app = Flask(__name__)
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "multi-dex-oracle"})
+
+
+@app.post("/api/verify")
+def api_verify():
+    """
+    Body JSON: { "chain": "bsc", "address": "0x...", "shadow_rpc": "..." (opsiyonel) }
+    Gölge RPC'lerin uydurma kontrat import'unu reddeder; resmi DEX factory pair hash zorunlu.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    chain = (body.get("chain") or request.args.get("chain") or "bsc").strip()
+    address = (body.get("address") or request.args.get("address") or "").strip()
+    shadow = body.get("shadow_rpc") or os.environ.get("SHADOW_RPC_URL", "")
+    if not address:
+        return jsonify({"ok": False, "error": "address required"}), 400
+    report = verify_contract_on_multi_dex(
+        chain,
+        address,
+        shadow_rpc=shadow or None,
+        strict_explorer=os.environ.get("MULTI_DEX_STRICT_EXPLORER", "0") == "1",
+        require_liquidity_pair=os.environ.get("MULTI_DEX_REQUIRE_PAIR", "0") == "1",
+    )
+    return jsonify(report.to_dict()), (200 if report.ok else 403)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("BACKEND_PORT", "8787"))
+    app.run(host="127.0.0.1", port=port, debug=False)
+'''
+
+
+def build_multi_dex_docs_md(cfg: dict) -> str:
+    sym = cfg["symbol"]
+    return f"""# Multi-DEX Oracle Consensus — {sym}
+
+Gölge (paralel) RPC'lerin BscScan'de olmayan **uydurma kontrat adreslerini** cüzdana
+import etmesine karşı zorunlu savunma katmanı.
+
+## Kontroller
+
+1. **Resmi RPC** `eth_getCode` — bytecode var mı?
+2. **Gölge RPC konsensüsü** (`SHADOW_RPC_URL`) — resmi ile aynı hash mi?
+3. **Explorer indeksi** (BscScan/Etherscan) — sahte adres filtresi
+4. **DEX Factory pair hash** — PancakeSwap / Uniswap / SunSwap `getPair` ↔ CREATE2 eşleşmesi
+
+## CLI
+
+```bash
+python3 backend/multi_dex_verifier.py --chain bsc --address 0xYourToken
+python3 backend/multi_dex_verifier.py --chain bsc --address 0x... --shadow-rpc https://shadow-rpc.example
+npx hardhat run scripts/verify-multi-dex.js --network bsc
+```
+
+## Backend API (dApp / cüzdan)
+
+```bash
+pip install flask requests pycryptodome
+python3 backend/api.py
+curl -X POST http://127.0.0.1:8787/api/verify \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"chain":"bsc","address":"0x..."}}'
+```
+
+## Deploy kapısı
+
+`scripts/deploy.js` deploy sonrası **MULTI_DEX_VERIFY=0** olmadıkça otomatik çalışır.
+Likidite henüz yoksa `MULTI_DEX_REQUIRE_PAIR=0` (varsayılan) bırakın.
+"""
+
+
+def build_multi_dex_security_files(cfg: dict, folder: str) -> None:
+    """verify_contract_on_multi_dex.py → paket backend + API + script + docs."""
+    backend_dir = os.path.join(folder, "backend")
+    os.makedirs(backend_dir, exist_ok=True)
+
+    src = os.path.join(_GENERATOR_DIR, "verify_contract_on_multi_dex.py")
+    if os.path.isfile(src):
+        shutil.copy2(src, os.path.join(backend_dir, "multi_dex_verifier.py"))
+    else:
+        write_file(
+            os.path.join(backend_dir, "multi_dex_verifier.py"),
+            "# multi_dex_verifier: verify_contract_on_multi_dex.py bulunamadı\\n",
+        )
+
+    write_file(os.path.join(backend_dir, "api.py"), build_backend_api_py(), executable=True)
+    write_file(os.path.join(folder, "scripts", "verify-multi-dex.js"), build_verify_multi_dex_js())
+    docs_dir = os.path.join(folder, "docs")
+    os.makedirs(docs_dir, exist_ok=True)
+    write_file(os.path.join(docs_dir, "MULTI_DEX_VERIFICATION.md"), build_multi_dex_docs_md(cfg))
+
+    req_path = os.path.join(backend_dir, "requirements.txt")
+    write_file(req_path, "requests>=2.31.0\\nflask>=3.0.0\\npycryptodome>=3.20.0\\n")
+
+
+def build_dapp_files_with_verify(cfg: dict, folder: str) -> None:
+    """React dApp + Multi-DEX doğrulama paneli (backend API ile konuşur)."""
+    dapp_dir = os.path.join(folder, "frontend")
+    api_port = "8787"
+    write_file(os.path.join(dapp_dir, "README.md"), f"""# Frontend dApp — {cfg["symbol"]}
+
+Vite + React. Token adresini backend Multi-DEX API ile doğrular.
+
+```bash
+# Terminal 1
+pip install -r backend/requirements.txt
+python3 backend/api.py
+
+# Terminal 2
+cd frontend && npm install && npm run dev
+```
+""")
+    write_file(os.path.join(dapp_dir, "index.html"), """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Token dApp — Multi-DEX Verify</title></head>
+<body><div id="root"></div><script type="module" src="/main.jsx"></script></body>
+</html>
+""")
+    write_file(
+        os.path.join(dapp_dir, "main.jsx"),
+        f"""import React, {{ useState }} from 'react';
+import ReactDOM from 'react-dom/client';
+
+const API = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:{api_port}';
+
+function App() {{
+  const [chain, setChain] = useState('bsc');
+  const [address, setAddress] = useState('');
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState('');
+
+  async function verify() {{
+    setErr('');
+    setResult(null);
+    try {{
+      const r = await fetch(`${{API}}/api/verify`, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ chain, address }}),
+      }});
+      const data = await r.json();
+      setResult(data);
+      if (!r.ok) setErr('Doğrulama reddedildi (gölge RPC / DEX factory).');
+    }} catch (e) {{
+      setErr(String(e));
+    }}
+  }}
+
+  return (
+    <div style={{ fontFamily: 'system-ui', maxWidth: 640, margin: '2rem auto', padding: 16 }}>
+      <h1>{cfg["name"]} ({cfg["symbol"]})</h1>
+      <p>Multi-DEX Oracle — resmi factory pair hash + gölge RPC konsensüsü.</p>
+      <label>Chain<br/>
+        <select value={{chain}} onChange={{e => setChain(e.target.value)}}>
+          <option value="bsc">BSC</option>
+          <option value="ethereum">Ethereum</option>
+          <option value="tron">Tron</option>
+        </select>
+      </label>
+      <br/><br/>
+      <label>Token address<br/>
+        <input style={{ width: '100%' }} value={{address}} onChange={{e => setAddress(e.target.value)}} placeholder="0x..." />
+      </label>
+      <br/><br/>
+      <button onClick={{verify}}>Verify on Multi-DEX</button>
+      {{err && <p style={{ color: 'crimson' }}>{{err}}</p>}}
+      {{result && (
+        <pre style={{ background: '#111', color: '#0f0', padding: 12, marginTop: 16 }}>
+          {{JSON.stringify(result, null, 2)}}
+        </pre>
+      )}}
+    </div>
+  );
+}}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+""",
+    )
+    write_file(
+        os.path.join(dapp_dir, "package.json"),
+        json.dumps(
+            {
+                "name": "ultra-secure-dapp",
+                "version": "1.0.0",
+                "private": True,
+                "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview"},
+                "dependencies": {"react": "^18.2.0", "react-dom": "^18.2.0"},
+                "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.2.0"},
+            },
+            indent=2,
+        ),
+    )
+    write_file(
+        os.path.join(dapp_dir, "vite.config.js"),
+        """import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()] });
+""",
+    )
 
 
 # -------------------------- DAO / dApp / Audit Copy --------------------------
@@ -2324,22 +2627,20 @@ def collect_config(*, chain_preset: str = "evm") -> dict:
         min_v=1,
     )
 
-    cap_unlimited = yes_no(
-        "  Üst mint limitini kaldır (ERC20Capped(cap=uint256.max) — sonrasında sınırsız basım)?",
-        default=True,
+    print(
+        f"  Mint tavanı: min(initial × çarpan, {MAX_CAP_SUPPLY_UNITS:,} token) "
+        f"— uint256.max kullanılmaz (MetaMask/Trust tarayıcı uyumu)."
     )
-    cap_mult = 1
-    cap_supply = total_supply
-    if cap_unlimited:
-        pass
-    else:
-        cap_mult = parse_int(
-            input("  Cap çarpanı — toplam cap = initial × bu değer (1=sabit arz yeniden mint için yer yok) [10]: ").strip()
-            or "10",
-            default=10,
-            min_v=1,
-        )
-        cap_supply = total_supply * cap_mult
+    cap_mult = parse_int(
+        input(
+            f"  Cap çarpanı — cap = min(initial × çarpan, {MAX_CAP_SUPPLY_UNITS:,}) "
+            f"[{DEFAULT_CAP_MULTIPLIER}]: "
+        ).strip()
+        or str(DEFAULT_CAP_MULTIPLIER),
+        default=DEFAULT_CAP_MULTIPLIER,
+        min_v=1,
+    )
+    cap_supply = compute_cap_supply(total_supply, cap_mult)
 
     license_id = input("  Lisans (MIT/Apache-2.0/GPL-3.0/UNLICENSED) [MIT]: ").strip() or "MIT"
 
@@ -2449,7 +2750,6 @@ def collect_config(*, chain_preset: str = "evm") -> dict:
         "total_supply": total_supply,
         "cap_multiplier": cap_mult,
         "cap_supply": cap_supply,
-        "cap_unlimited": cap_unlimited,
         "asset_class": asset_class,
         "license": license_id,
         "pragma_version": pragma_version,
@@ -2481,8 +2781,6 @@ def collect_config(*, chain_preset: str = "evm") -> dict:
         "telegram": telegram,
         "discord": discord,
         "token_uri": token_uri,
-        "asset_class": asset_class,
-        "cap_unlimited": cap_unlimited,
         "price_usd_e8": price_usd_e8,
         "auto_verify": auto_verify,
     }
@@ -2561,6 +2859,7 @@ def create_ultra_secure_token_package(cfg: dict) -> None:
 
     # scripts/
     write_file(os.path.join(folder, "scripts", "deploy.js"), build_deploy_script(cfg))
+    build_multi_dex_security_files(cfg, folder)
     # CREATE2 + adres tahmin + vanity miner (sadece EVM zincirler için anlamlı)
     if not cfg["is_tron"]:
         # Factory contract (contracts/ altına; Tron'da pragma uyumsuz olabilir, atlanır)
@@ -2576,6 +2875,8 @@ def create_ultra_secure_token_package(cfg: dict) -> None:
     deploy_scripts = {
         "compile": "hardhat compile",
         "test": "hardhat test",
+        "verify:multi-dex": "hardhat run scripts/verify-multi-dex.js --network bsc",
+        "backend:api": "python3 backend/api.py",
     }
     for nid in cfg["networks_evm"]:
         deploy_scripts[f"deploy:{nid}"] = f"hardhat run scripts/deploy.js --network {nid}"
@@ -2619,6 +2920,14 @@ deployments/localhost/
         "",
         "# Auto-verify",
         "AUTO_VERIFY=true",
+        "",
+        "# Multi-DEX oracle consensus (ZORUNLU — gölge RPC / sahte kontrat savunması)",
+        "MULTI_DEX_VERIFY=1          # 0 = kapıyı kapat (önerilmez)",
+        "SHADOW_RPC_URL=             # Paralel/gölge RPC (resmi RPC ile karşılaştırılır)",
+        "MULTI_DEX_STRICT_EXPLORER=0 # 1 = explorer indeksi zorunlu",
+        "MULTI_DEX_REQUIRE_PAIR=0    # 1 = DEX'te likidite pair zorunlu (yeni deploy için 0)",
+        "BACKEND_PORT=8787           # dApp → backend/api.py",
+        "TOKEN_ADDRESS=              # verify-multi-dex.js için",
         "",
         "# CREATE2 deterministic / vanity deploy (opsiyonel)",
         "FACTORY_ADDRESS=0x4e59b44847b379578588920cA78FbF26c0B4956C  # Canonical (BSC, ETH, Polygon, Arb, Base ...)",
@@ -2786,7 +3095,7 @@ print("🧪 Manticore setup complete.")
     if cfg["include_dao"]:
         build_dao_files(cfg, folder)
     if cfg["include_dapp"]:
-        build_dapp_files(folder)
+        build_dapp_files_with_verify(cfg, folder)
 
     # ZIP
     if os.path.exists(folder + ".zip"):
